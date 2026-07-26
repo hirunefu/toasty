@@ -74,11 +74,24 @@ indexmap.workspace = true
 index_vec.workspace = true
 inventory.workspace = true
 serde = { workspace = true, optional = true }
-tokio.workspace = true
+# Not the workspace's `full`: that pulls in `net`, and therefore mio, which
+# does not build for wasm32 — while toasty itself only ever uses the runtime,
+# `select!`, `spawn`, a oneshot channel, and timers.
+tokio = { version = "1.50", default-features = false, features = [
+	"macros",
+	"rt",
+	"sync",
+	"time",
+] }
 toml = { workspace = true, optional = true }
 toml_edit = { workspace = true, features = ["serde"], optional = true }
 tracing.workspace = true
 url.workspace = true
+
+# wasm32 drives futures on the JavaScript event loop rather than a tokio
+# runtime, so the per-connection task is spawned there instead.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 assert-struct.workspace = true

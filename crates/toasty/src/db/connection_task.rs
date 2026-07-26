@@ -13,10 +13,9 @@ use std::sync::Arc;
 use toasty_core::driver::operation::RawSql;
 use toasty_core::driver::{Connection, Rows};
 use toasty_core::stmt::Value;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::{mpsc, oneshot};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use super::pool::SweepWaker;
@@ -69,7 +68,15 @@ pub(crate) enum ConnectionOperation {
 /// finish processing remaining messages and exit gracefully.
 pub(crate) struct ConnectionHandle {
     pub(crate) in_tx: mpsc::UnboundedSender<ConnectionOperation>,
+    /// How the task reports that it has exited.
+    ///
+    /// wasm32 has no tokio runtime to spawn onto -- futures are driven by the
+    /// JavaScript event loop -- and `spawn_local` hands back nothing to ask,
+    /// so the task sets a flag on its way out instead.
+    #[cfg(not(target_arch = "wasm32"))]
     join_handle: JoinHandle<()>,
+    #[cfg(target_arch = "wasm32")]
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConnectionHandle {
@@ -90,14 +97,36 @@ impl ConnectionHandle {
             in_rx,
             sweep_waker,
         };
-        let join_handle = tokio::spawn(task.run());
-        Self { in_tx, join_handle }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let join_handle = tokio::spawn(task.run());
+            Self { in_tx, join_handle }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let finished = std::sync::Arc::new(AtomicBool::new(false));
+            let done = finished.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                task.run().await;
+                done.store(true, Ordering::Relaxed);
+            });
+            Self { in_tx, finished }
+        }
     }
 
     /// Returns true once the worker task has exited. Used by the pool's
     /// `recycle` to detect dead slots.
     pub(crate) fn is_finished(&self) -> bool {
-        self.join_handle.is_finished()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.join_handle.is_finished()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.finished.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 }
 
@@ -105,7 +134,7 @@ impl std::fmt::Debug for ConnectionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionHandle")
             .field("channel_closed", &self.in_tx.is_closed())
-            .field("task_finished", &self.join_handle.is_finished())
+            .field("task_finished", &self.is_finished())
             .finish()
     }
 }

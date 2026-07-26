@@ -118,6 +118,16 @@ impl Pool {
             toasty_core::Error::connection_pool(e)
         })?;
 
+        // The periodic health-check sweep needs a timer, which needs a tokio
+        // runtime. wasm32 has neither -- and has no use for the sweep either:
+        // there is one short-lived isolate per request burst, so a connection
+        // never sits idle long enough to go stale unnoticed.
+        #[cfg(target_arch = "wasm32")]
+        let sweep_task = {
+            let _ = (&sweep_waker, config.health_check_interval);
+            None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
         let sweep_task = config.health_check_interval.map(|interval| {
             let task = SweepTask {
                 pool: inner.clone(),
@@ -215,22 +225,32 @@ impl deadpool::managed::Manager for Manager {
         obj: &mut Self::Type,
         metrics: &deadpool::managed::Metrics,
     ) -> deadpool::managed::RecycleResult<Self::Error> {
-        if let Some(max) = self.max_connection_lifetime
-            && metrics.age() >= max
+        // Age-based recycling needs a monotonic clock, which
+        // wasm32-unknown-unknown does not have -- deadpool omits these
+        // accessors there rather than panicking. A connection on that target
+        // is therefore kept until it dies or the pool is dropped, which suits
+        // the environment: an isolate is short-lived to begin with.
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            tracing::debug!(?max, "discarding pooled connection past max lifetime");
-            return Err(deadpool::managed::RecycleError::message(
-                "connection exceeded max lifetime",
-            ));
+            if let Some(max) = self.max_connection_lifetime
+                && metrics.age() >= max
+            {
+                tracing::debug!(?max, "discarding pooled connection past max lifetime");
+                return Err(deadpool::managed::RecycleError::message(
+                    "connection exceeded max lifetime",
+                ));
+            }
+            if let Some(max) = self.max_connection_idle_time
+                && metrics.last_used() >= max
+            {
+                tracing::debug!(?max, "discarding pooled connection past max idle time");
+                return Err(deadpool::managed::RecycleError::message(
+                    "connection exceeded max idle time",
+                ));
+            }
         }
-        if let Some(max) = self.max_connection_idle_time
-            && metrics.last_used() >= max
-        {
-            tracing::debug!(?max, "discarding pooled connection past max idle time");
-            return Err(deadpool::managed::RecycleError::message(
-                "connection exceeded max idle time",
-            ));
-        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = metrics;
         if obj.in_tx.is_closed() || obj.is_finished() {
             tracing::debug!("discarding dead pooled connection");
             return Err(deadpool::managed::RecycleError::message(
